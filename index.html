@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Slingshot</title>
+<style>
+  :root { --bg:#000; --hack:#00ff88; --dim:#0a0; --ui:#111; }
+  html,body{height:100%;margin:0;background:var(--bg);color:#fff;font-family:system-ui,Arial}
+  /* fixed header/footer so main action scrolls under if needed later */
+  header,footer{position:fixed;left:0;right:0;background:#000a;backdrop-filter:blur(4px)}
+  header{top:0;height:52px;display:flex;align-items:center;justify-content:center;border-bottom:1px solid #0f5}
+  footer{bottom:0;height:52px;display:flex;align-items:center;justify-content:center;border-top:1px solid #0f5}
+  main{position:fixed;inset:52px 0 52px 0;overflow:hidden}
+
+  canvas{position:absolute;inset:0;display:block;width:100%;height:100%}
+
+  /* slingshot button */
+  .sling {
+    position:absolute; right:18px; bottom:18px; width:68px; height:68px;
+    border-radius:50%; background:var(--ui); border:2px solid var(--hack);
+    display:grid; place-items:center; user-select:none; touch-action:none; cursor:pointer;
+    box-shadow:0 0 16px #0f84 inset, 0 0 16px #0f84;
+  }
+  .sling:active { transform:scale(0.97); }
+  .sling-label{font-weight:700; font-size:11px; color:var(--hack); text-align:center; line-height:1.1}
+
+  /* aim line */
+  .aim {
+    position:absolute; pointer-events:none;
+    left:0; top:0; width:100%; height:100%;
+  }
+</style>
+</head>
+<body>
+<header>T‑Cell Slingshot</header>
+
+<main>
+  <canvas id="stage"></canvas>
+  <canvas id="aim" class="aim"></canvas>
+
+  <div id="sling" class="sling">
+    <div class="sling-label">SLING<br>SHOT</div>
+  </div>
+</main>
+
+<footer>Drag the button → release to fire. Hit letters to stick.</footer>
+
+<script>
+(() => {
+  const canvas = document.getElementById('stage');
+  const ctx = canvas.getContext('2d');
+  const aimCanvas = document.getElementById('aim');
+  const actx = aimCanvas.getContext('2d');
+
+  const DPR = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+
+  let W=0,H=0; const resize=()=> {
+    const rect = canvas.getBoundingClientRect();
+    W = Math.floor(rect.width * DPR); H = Math.floor(rect.height * DPR);
+    canvas.width=W; canvas.height=H; aimCanvas.width=W; aimCanvas.height=H;
+    ctx.setTransform(DPR,0,0,DPR,0,0); actx.setTransform(DPR,0,0,DPR,0,0);
+  };
+  addEventListener('resize', resize, {passive:true});
+  resize();
+
+  // Matrix rain columns
+  const glyphs = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  const colSize = 16; // px
+  const cols = Math.ceil(W / (colSize * DPR));
+  const streams = [];
+  function initStreams(){
+    streams.length = 0;
+    const colW = colSize;
+    const ncols = Math.ceil((W / DPR) / colW);
+    for (let i=0;i<ncols;i++){
+      streams.push({
+        x: i*colW + colW*0.5,
+        y: -Math.random()*500,
+        speed: 60 + Math.random()*120, // px/s
+        chars: []
+      });
+    }
+  }
+  initStreams();
+  addEventListener('resize', initStreams);
+
+  // Balls (T-cells)
+  const balls = []; // {x,y,vx,vy,r,alive}
+  // Stuck relations: letters know if a ball is attached
+  // We'll store transient letter draw positions each frame to test collisions.
+  let letterSprites = []; // [{x,y,w,h, char, streamIndex, yIndex, stuckBallId?}]
+
+  // Time
+  let last = performance.now();
+  function step(t){
+    const dt = Math.min(0.033, (t-last)/1000); last = t;
+    update(dt);
+    draw(dt);
+    requestAnimationFrame(step);
+  }
+  requestAnimationFrame(step);
+
+  function update(dt){
+    // update streams
+    const viewW = W/DPR, viewH = H/DPR;
+    for (const s of streams){
+      s.y += s.speed * dt;
+      if (s.y > viewH + 120) { s.y = -Math.random()*400; s.speed = 60 + Math.random()*120; }
+    }
+    // update balls (gravity, drag)
+    for (const b of balls){
+      if (!b.alive) continue;
+      b.vy += 500 * dt;                 // gravity
+      b.vx *= Math.pow(0.995, dt*60);   // air drag
+      b.vy *= Math.pow(0.995, dt*60);
+      b.x += b.vx * dt;
+      b.y += b.vy * dt;
+
+      // bounce off walls
+      if (b.x < b.r) { b.x=b.r; b.vx*=-0.7; }
+      if (b.x > viewW-b.r) { b.x=viewW-b.r; b.vx*=-0.7; }
+      if (b.y > viewH-b.r) { b.y=viewH-b.r; b.vy*=-0.55; b.vx*=0.98; }
+
+      // if fell way out (shouldn't), kill
+      if (b.y > viewH+200) b.alive=false;
+    }
+
+    // collisions balls ↔ letters
+    // letterSprites built in draw() just before we render text, so handle collision there after computing them.
+  }
+
+  function draw(){
+    const viewW = W/DPR, viewH = H/DPR;
+
+    // clear
+    ctx.clearRect(0,0,viewW,viewH);
+    letterSprites = [];
+
+    // draw streams (matrix rain)
+    ctx.textAlign='center';
+    ctx.textBaseline='top';
+    ctx.font = `${colSize}px monospace`;
+
+    for (const s of streams){
+      let y = s.y;
+      const x = s.x;
+      const steps = Math.ceil(viewH / colSize) + 6;
+      for (let i=0;i<steps;i++){
+        const ch = glyphs[(Math.random()*glyphs.length)|0];
+        const bright = i === 0 ? 0.95 : 0.6 - (i/steps)*0.5;
+        const col = `rgba(0,255,136,${Math.max(0.08, bright)})`;
+        ctx.fillStyle = col;
+        ctx.fillText(ch, x, y);
+        // store for collision
+        letterSprites.push({
+          x: x, y: y, w: colSize, h: colSize, char: ch,
+          streamIndex: streams.indexOf(s), yIndex: i, stuckBallId: null
+        });
+        y += colSize;
+      }
+    }
+
+    // collide AFTER we have letterSprites
+    collideBallsToLetters();
+
+    // draw balls
+    for (const b of balls){
+      if (!b.alive) continue;
+      ctx.beginPath();
+      ctx.arc(b.x, b.y, b.r, 0, Math.PI*2);
+      ctx.closePath();
+      ctx.fillStyle = '#66ffee';
+      ctx.shadowColor = '#66ffee';
+      ctx.shadowBlur = 10;
+      ctx.fill();
+      ctx.shadowBlur = 0;
+      // little nucleus
+      ctx.beginPath();
+      ctx.arc(b.x-2, b.y-2, b.r*0.4, 0, Math.PI*2);
+      ctx.fillStyle = '#00b7ff';
+      ctx.fill();
+    }
+
+    // if any letters have stuck balls, draw a tiny link
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = 'rgba(0,255,136,0.8)';
+    for (const l of letterSprites){
+      if (l.stuckBallId != null){
+        const b = balls[l.stuckBallId];
+        if (b && b.alive){
+          ctx.beginPath();
+          ctx.moveTo(l.x, l.y);
+          ctx.lineTo(b.x, b.y);
+          ctx.stroke();
+        }
+      }
+    }
+  }
+
+  function collideBallsToLetters(){
+    const viewW = W/DPR, viewH = H/DPR;
+    // Build a cheap spatial bucket to keep perf nice
+    const cell = 32, cols = Math.ceil(viewW/cell), rows = Math.ceil(viewH/cell);
+    const grid = Array.from({length:cols*rows},()=>[]);
+    function keyFor(x,y){ return (Math.floor(x/cell) + Math.floor(y/cell)*cols); }
+
+    for (let i=0;i<letterSprites.length;i++){
+      const L = letterSprites[i];
+      // skip letters that are off screen just in case
+      if (L.y < -32 || L.y > viewH+32) continue;
+      const k = keyFor(L.x, L.y);
+      if (grid[k]) grid[k].push(i);
+    }
+
+    for (let bi=0; bi<balls.length; bi++){
+      const b = balls[bi];
+      if (!b.alive) continue;
+      const k = keyFor(b.x, b.y);
+      const neigh = [];
+      for (let ny=-1; ny<=1; ny++){
+        for (let nx=-1; nx<=1; nx++){
+          const kk = k + nx + ny*cols;
+          if (grid[kk]) neigh.push(...grid[kk]);
+        }
+      }
+      for (const li of neigh){
+        const L = letterSprites[li];
+        if (L.stuckBallId != null) continue; // already taken
+        // circle-rect collision (approx)
+        const hw = L.w*0.5, hh = L.h*0.5;
+        const cx = L.x, cy = L.y+2; // slight offset for nicer feel
+        const dx = Math.max(Math.abs(b.x - cx) - hw, 0);
+        const dy = Math.max(Math.abs(b.y - cy) - hh, 0);
+        const dist = Math.hypot(dx, dy);
+        if (dist <= b.r*0.9){
+          // stick: snap ball to letter and mark as attached (kill its physics)
+          b.x = cx; b.y = cy;
+          b.vx = 0; b.vy = 0;
+          b.alive = true; // stays, but no physics advance
+          // freeze by flag
+          b.frozen = true;
+          L.stuckBallId = bi;
+          // also tint the letter glow by re-drawing a brighter one
+          ctx.save();
+          ctx.fillStyle = '#aaffee';
+          ctx.font = `${colSize}px monospace`;
+          ctx.textAlign='center'; ctx.textBaseline='top';
+          ctx.fillText(L.char, L.x, L.y);
+          ctx.restore();
+          break;
+        }
+      }
+    }
+  }
+
+  // Slingshot input
+  const sling = document.getElementById('sling');
+  let dragging=false, startX=0, startY=0, curX=0, curY=0;
+
+  const getLocal = (ev) => {
+    const r = canvas.getBoundingClientRect();
+    if (ev.touches && ev.touches[0]){
+      return { x: (ev.touches[0].clientX - r.left), y: (ev.touches[0].clientY - r.top) };
+    } else {
+      return { x: (ev.clientX - r.left), y: (ev.clientY - r.top) };
+    }
+  };
+
+  function drawAim(){
+    actx.clearRect(0,0,aimCanvas.width/DPR,aimCanvas.height/DPR);
+    if (!dragging) return;
+    const sx = startX, sy = startY, ex = curX, ey = curY;
+    actx.beginPath();
+    actx.moveTo(sx, sy);
+    actx.lineTo(ex, ey);
+    actx.strokeStyle = 'rgba(0,255,136,0.9)';
+    actx.lineWidth = 3;
+    actx.stroke();
+    // pull magnitude indicator
+    const d = Math.hypot(ex-sx, ey-sy);
+    actx.beginPath();
+    actx.arc(sx, sy, Math.min(14 + d*0.05, 30), 0, Math.PI*2);
+    actx.strokeStyle = 'rgba(0,255,136,0.5)';
+    actx.lineWidth = 2;
+    actx.stroke();
+  }
+
+  const startDrag = (ev) => {
+    ev.preventDefault();
+    dragging = true;
+    // start from button center as sling origin
+    const br = sling.getBoundingClientRect();
+    startX = (br.left + br.width/2) - canvas.getBoundingClientRect().left;
+    startY = (br.top  + br.height/2) - canvas.getBoundingClientRect().top;
+    curX = startX; curY = startY;
+    drawAim();
+  };
+  const moveDrag = (ev) => {
+    if (!dragging) return;
+    const p = getLocal(ev);
+    curX = p.x; curY = p.y;
+    drawAim();
+  };
+  const endDrag = (ev) => {
+    if (!dragging) return;
+    dragging = false;
+    actx.clearRect(0,0,aimCanvas.width/DPR,aimCanvas.height/DPR);
+
+    // Launch opposite the pull vector (slingshot)
+    const pullX = curX - startX;
+    const pullY = curY - startY;
+    const power = Math.min(900, Math.hypot(pullX, pullY) * 12); // tune
+    if (power > 10){
+      const ang = Math.atan2(pullY, pullX) + Math.PI; // opposite
+      const speed = power; // px/s
+      balls.push({
+        x: startX, y: startY,
+        vx: Math.cos(ang)*speed,
+        vy: Math.sin(ang)*speed,
+        r: 10, alive: true, frozen: false
+      });
+    }
+  };
+
+  // mouse/touch on the button
+  sling.addEventListener('mousedown', startDrag);
+  window.addEventListener('mousemove', moveDrag, {passive:false});
+  window.addEventListener('mouseup', endDrag);
+
+  sling.addEventListener('touchstart', startDrag, {passive:false});
+  window.addEventListener('touchmove', moveDrag, {passive:false});
+  window.addEventListener('touchend', endDrag);
+
+})();
+</script>
+</body>
+</html>
